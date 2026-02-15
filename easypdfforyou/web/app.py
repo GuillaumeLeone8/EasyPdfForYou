@@ -1,341 +1,170 @@
 """Web interface for EasyPdfForYou."""
 
 import os
-import logging
 import tempfile
 from pathlib import Path
-from typing import Optional
-from datetime import datetime
+from typing import Any
 
-from flask import Flask, render_template, request, send_file, jsonify, flash, redirect, url_for
-from werkzeug.utils import secure_filename
+from flask import Flask, render_template, request, send_file, jsonify
 
-from ..core.config import Config
-from ..core.pdf_extractor import PdfExtractor
-from ..core.ocr_engine import OcrEngine
-from ..core.translator import create_translator
-from ..core.bilingual_generator import BilingualGenerator
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# Create Flask app
-app = Flask(__name__)
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
-
-# Configuration
-config = Config()
-
-# Allowed file extensions
-ALLOWED_EXTENSIONS = {'pdf'}
+from easypdfforyou.core.pdf_extractor import PdfExtractor
+from easypdfforyou.core.ocr_engine import OcrEngine
+from easypdfforyou.core.translator import TranslationService
+from easypdfforyou.core.bilingual_generator import BilingualGenerator
 
 
-def allowed_file(filename: str) -> bool:
-    """Check if file has allowed extension.
+def create_app() -> Flask:
+    """Create and configure Flask application."""
+    app = Flask(
+        __name__,
+        template_folder="templates",
+        static_folder="static"
+    )
     
-    Args:
-        filename: Name of file.
-        
-    Returns:
-        True if allowed.
-    """
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-
-
-@app.route('/')
-def index():
-    """Render main page."""
-    return render_template('index.html',
-                         languages=Config.SUPPORTED_LANGUAGES,
-                         providers=['google', 'openrouter'])
-
-
-@app.route('/api/extract', methods=['POST'])
-def api_extract():
-    """API endpoint to extract text from PDF."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
+    app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB max file size
+    app.config["UPLOAD_FOLDER"] = tempfile.gettempdir()
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
+    @app.route("/")
+    def index() -> str:
+        """Render the main page."""
+        return render_template("index.html")
     
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Only PDF allowed.'}), 400
+    @app.route("/api/extract", methods=["POST"])
+    def api_extract() -> Any:
+        """API endpoint for text extraction."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
+        
+        try:
+            # Save uploaded file
+            filepath = Path(app.config["UPLOAD_FOLDER"]) / file.filename
+            file.save(filepath)
+            
+            # Extract text
+            extractor = PdfExtractor()
+            pages = extractor.extract_text(filepath)
+            
+            result = {
+                "pages": [
+                    {
+                        "page_num": page.page_num + 1,
+                        "text": page.text,
+                        "width": page.width,
+                        "height": page.height,
+                    }
+                    for page in pages
+                ]
+            }
+            
+            # Clean up
+            filepath.unlink(missing_ok=True)
+            
+            return jsonify(result)
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     
-    try:
-        # Save uploaded file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
+    @app.route("/api/translate", methods=["POST"])
+    def api_translate() -> Any:
+        """API endpoint for PDF translation."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
         
-        # Extract text
-        extractor = PdfExtractor()
-        extractor.open(tmp_path)
+        file = request.files["file"]
+        if file.filename == "":
+            return jsonify({"error": "No file selected"}), 400
         
-        page_contents = extractor.extract_all_pages()
+        # Get parameters
+        source_lang = request.form.get("source_lang", "auto")
+        target_lang = request.form.get("target_lang", "zh-CN")
+        layout = request.form.get("layout", "side_by_side")
+        use_ocr = request.form.get("use_ocr", "false").lower() == "true"
         
-        result = {
-            'page_count': extractor.page_count,
-            'metadata': extractor.metadata,
-            'is_scanned': extractor.is_scanned(),
-            'pages': []
-        }
-        
-        for page in page_contents:
-            result['pages'].append({
-                'page_num': page.page_num + 1,
-                'text': page.full_text,
-                'has_text': page.has_text,
-                'text_blocks_count': len(page.text_blocks),
-                'images_count': len(page.images)
-            })
-        
-        extractor.close()
-        
-        # Cleanup
-        os.unlink(tmp_path)
-        
-        return jsonify(result)
-        
-    except Exception as e:
-        logger.error(f"Extraction error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/translate', methods=['POST'])
-def api_translate():
-    """API endpoint to translate PDF."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-    
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    # Get parameters
-    source_lang = request.form.get('source_lang', 'auto')
-    target_lang = request.form.get('target_lang', 'zh-CN')
-    provider = request.form.get('provider', 'google')
-    api_key = request.form.get('api_key', '')
-    use_ocr = request.form.get('use_ocr', 'false').lower() == 'true'
-    output_format = request.form.get('format', 'side_by_side')
-    
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Only PDF allowed.'}), 400
-    
-    try:
-        # Save uploaded file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
-        
-        # Extract text
-        extractor = PdfExtractor()
-        extractor.open(tmp_path)
-        
-        # Use OCR if requested or auto-detected
-        if use_ocr or (not use_ocr and extractor.is_scanned()):
-            ocr = OcrEngine(tesseract_cmd=config.get('tesseract_cmd'))
-            page_images = extractor.render_all_pages()
-            texts = ocr.process_scanned_pdf(page_images, source_lang)
-        else:
-            page_contents = extractor.extract_all_pages()
-            texts = [page.full_text for page in page_contents]
-        
-        # Translate
-        if api_key:
-            translator = create_translator(provider, api_key)
-        else:
-            translator = create_translator(provider, config.get(f'{provider}_api_key'))
-        
-        translations = []
-        for text in texts:
-            result = translator.translate(text, target_lang, source_lang)
-            translations.append(result.translated_text)
-        
-        extractor.close()
-        
-        # Generate output
-        if output_format == 'text':
-            # Return as text
-            output_text = "\n\n---\n\n".join(translations)
-            output_path = tempfile.mktemp(suffix='.txt')
-            Path(output_path).write_text(output_text, encoding='utf-8')
-            mime_type = 'text/plain'
-        else:
+        try:
+            # Save uploaded file
+            input_path = Path(app.config["UPLOAD_FOLDER"]) / file.filename
+            file.save(input_path)
+            
+            output_filename = f"{input_path.stem}_{target_lang}.pdf"
+            output_path = Path(app.config["UPLOAD_FOLDER"]) / output_filename
+            
+            # Extract text
+            extractor = PdfExtractor()
+            
+            if use_ocr or extractor.is_scanned_pdf(input_path):
+                pages_text = []
+                ocr_engine = OcrEngine()
+                for i in range(len(extractor.extract_text(input_path, max_pages=1))):
+                    img = extractor.render_page_to_image(input_path, page_num=i)
+                    text = ocr_engine.recognize(img, lang=source_lang if source_lang != "auto" else "eng")
+                    pages_text.append(text)
+            else:
+                pages = extractor.extract_text(input_path)
+                pages_text = [page.text for page in pages]
+            
+            # Translate
+            translator = TranslationService()
+            translated_pages = translator.translate_batch(pages_text, source_lang, target_lang)
+            
             # Generate bilingual PDF
-            generator = BilingualGenerator(font_path=config.get('font_path'))
-            output_path = tempfile.mktemp(suffix='.pdf')
+            generator = BilingualGenerator()
             generator.generate(
-                original_texts=texts,
-                translated_texts=translations,
-                output_path=output_path,
-                format_type=output_format,
-                title=f"Translated Document ({source_lang} → {target_lang})"
+                pages_text,
+                translated_pages,
+                output_path,
+                layout=layout,
+                original_pdf_path=input_path
             )
-            mime_type = 'application/pdf'
-        
-        # Cleanup input file
-        os.unlink(tmp_path)
-        
-        # Return file
-        return send_file(
-            output_path,
-            mimetype=mime_type,
-            as_attachment=True,
-            download_name=f"translated_{file.filename}"
-        )
-        
-    except Exception as e:
-        logger.error(f"Translation error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/ocr', methods=['POST'])
-def api_ocr():
-    """API endpoint for OCR."""
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
+            
+            # Clean up input file
+            input_path.unlink(missing_ok=True)
+            
+            return send_file(
+                output_path,
+                mimetype="application/pdf",
+                as_attachment=True,
+                download_name=output_filename
+            )
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
+    @app.route("/api/ocr", methods=["POST"])
+    def api_ocr() -> Any:
+        """API endpoint for OCR."""
+        if "file" not in request.files:
+            return jsonify({"error": "No file provided"}), 400
+        
+        file = request.files["file"]
+        lang = request.form.get("lang", "eng")
+        page_num = int(request.form.get("page", 0))
+        
+        try:
+            # Save uploaded file
+            filepath = Path(app.config["UPLOAD_FOLDER"]) / file.filename
+            file.save(filepath)
+            
+            # Perform OCR
+            extractor = PdfExtractor()
+            img = extractor.render_page_to_image(filepath, page_num=page_num)
+            
+            ocr_engine = OcrEngine()
+            text = ocr_engine.recognize(img, lang=lang)
+            
+            # Clean up
+            filepath.unlink(missing_ok=True)
+            
+            return jsonify({
+                "page": page_num + 1,
+                "language": lang,
+                "text": text
+            })
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     
-    lang = request.form.get('lang', config.get('tesseract_lang'))
-    
-    if not allowed_file(file.filename):
-        return jsonify({'error': 'Invalid file type. Only PDF allowed.'}), 400
-    
-    try:
-        # Save uploaded file
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
-        
-        # OCR
-        extractor = PdfExtractor(dpi=300)
-        extractor.open(tmp_path)
-        
-        ocr = OcrEngine(tesseract_cmd=config.get('tesseract_cmd'), lang=lang)
-        
-        texts = []
-        for i in range(extractor.page_count):
-            img = extractor.render_page_to_image(i)
-            text = ocr.recognize_pdf_page(img, i)
-            texts.append(text)
-        
-        extractor.close()
-        os.unlink(tmp_path)
-        
-        return jsonify({
-            'page_count': len(texts),
-            'texts': texts,
-            'full_text': "\n\n--- Page Break ---\n\n".join(texts)
-        })
-        
-    except Exception as e:
-        logger.error(f"OCR error: {e}")
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/upload', methods=['POST'])
-def upload():
-    """Handle file upload and translation."""
-    if 'file' not in request.files:
-        flash('No file provided', 'error')
-        return redirect(url_for('index'))
-    
-    file = request.files['file']
-    if file.filename == '':
-        flash('No file selected', 'error')
-        return redirect(url_for('index'))
-    
-    if not allowed_file(file.filename):
-        flash('Invalid file type. Only PDF allowed.', 'error')
-        return redirect(url_for('index'))
-    
-    # Get form parameters
-    source_lang = request.form.get('source_lang', 'auto')
-    target_lang = request.form.get('target_lang', 'zh-CN')
-    provider = request.form.get('provider', 'google')
-    api_key = request.form.get('api_key', '')
-    
-    try:
-        # Save file
-        filename = secure_filename(file.filename)
-        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
-            file.save(tmp.name)
-            tmp_path = tmp.name
-        
-        # Extract and translate
-        extractor = PdfExtractor()
-        extractor.open(tmp_path)
-        
-        if extractor.is_scanned():
-            flash('Detected scanned PDF, using OCR...', 'info')
-            ocr = OcrEngine(tesseract_cmd=config.get('tesseract_cmd'))
-            page_images = extractor.render_all_pages()
-            texts = ocr.process_scanned_pdf(page_images, source_lang)
-        else:
-            page_contents = extractor.extract_all_pages()
-            texts = [page.full_text for page in page_contents]
-        
-        # Translate
-        translator = create_translator(
-            provider,
-            api_key or config.get(f'{provider}_api_key')
-        )
-        
-        translations = []
-        for text in texts:
-            result = translator.translate(text, target_lang, source_lang)
-            translations.append(result.translated_text)
-        
-        extractor.close()
-        
-        # Generate output
-        generator = BilingualGenerator(font_path=config.get('font_path'))
-        output_path = tempfile.mktemp(suffix='.pdf')
-        generator.generate(
-            original_texts=texts,
-            translated_texts=translations,
-            output_path=output_path,
-            format_type='side_by_side',
-            title=f"Translated: {filename}"
-        )
-        
-        os.unlink(tmp_path)
-        
-        return send_file(
-            output_path,
-            mimetype='application/pdf',
-            as_attachment=True,
-            download_name=f"translated_{filename}"
-        )
-        
-    except Exception as e:
-        logger.error(f"Upload processing error: {e}")
-        flash(f'Error processing file: {e}', 'error')
-        return redirect(url_for('index'))
-
-
-def run_app(host: Optional[str] = None, port: Optional[int] = None, debug: bool = False):
-    """Run the Flask application.
-    
-    Args:
-        host: Host to bind to.
-        port: Port to bind to.
-        debug: Enable debug mode.
-    """
-    host = host or config.get('web_host', '0.0.0.0')
-    port = port or config.get('web_port', 5000)
-    debug = debug or config.get('web_debug', False)
-    
-    app.run(host=host, port=port, debug=debug)
-
-
-if __name__ == '__main__':
-    run_app()
+    return app
